@@ -155,5 +155,5 @@ openstatz==0.4.1
 # production alone, which is the class of failure CLAUDE.md notes cannot be
 # reproduced on the dev server. 0.41.2 is the current release and declares
 # greenlet>=1.0 with no upper bound.
-gunicorn>=25.0,<26
+gunicorn>=26.2.0,<27
 eventlet==0.41.2
