@@ -1,4 +1,4 @@
-aniso8601==9.0.1
+aniso8601==10.0.1
 annotated-types==0.8.0
 anyio==4.15.1
 appnope==0.1.4
@@ -56,8 +56,8 @@ jedi==0.20.1
 Jinja2==3.1.6
 joserfc==1.7.7
 jsonschema==4.26.0
-jsonschema-specifications==2023.12.1
 jupyter-client==8.10.0
+jsonschema-specifications==2025.9.1
 jupyter-core==5.9.1
 kaleido==1.5.0
 limits==5.8.0
@@ -79,7 +79,7 @@ openalgo==2.0.5
 ordered-set==4.1.0
 orjson==3.13.0
 packaging==24.1
-pandas==2.3.3
+pandas==3.1.0
 pyarrow==23.0.1
 fastparquet==2025.12.0
 parso==0.8.7
@@ -155,5 +155,5 @@ openstatz==0.5.0
 # production alone, which is the class of failure CLAUDE.md notes cannot be
 # reproduced on the dev server. 0.41.2 is the current release and declares
 # greenlet>=1.0 with no upper bound.
-gunicorn>=25.0,<26
 eventlet==0.41.3
+gunicorn>=26.2.0,<27

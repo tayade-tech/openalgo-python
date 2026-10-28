@@ -4,7 +4,7 @@ name = "openalgoUI"
 version = "2.0.2.5"
 description = "Broker-agnostic open-source trading automation"
 dependencies = [
-  "aniso8601==9.0.1",
+  "aniso8601==10.0.1",
   "annotated-types==0.8.0",
   "anyio==4.15.1",
   "appnope==0.1.4",
@@ -62,8 +62,8 @@ dependencies = [
   "Jinja2==3.1.6",
   "joserfc==1.7.7",
   "jsonschema==4.26.0",
-  "jsonschema-specifications==2023.12.1",
   "jupyter-client==8.10.0",
+  "jsonschema-specifications==2025.9.1",
   "jupyter-core==5.9.1",
   "kaleido==1.5.0",
   "limits==5.8.0",
@@ -84,7 +84,7 @@ dependencies = [
   "ordered-set==4.1.0",
   "orjson==3.13.0",
   "packaging==24.1",
-  "pandas==2.3.3",
+  "pandas==3.1.0",
   "pyarrow==23.0.1",
   "fastparquet==2025.12.0",
   "parso==0.8.7",
