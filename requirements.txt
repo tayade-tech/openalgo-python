@@ -1,4 +1,4 @@
-aniso8601==9.0.1
+aniso8601==10.0.1
 annotated-types==0.8.0
 anyio==4.14.2
 appnope==0.1.4
