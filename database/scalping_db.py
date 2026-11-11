@@ -98,6 +98,32 @@ class ScalpingTrackedSymbol(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class ScalpingPendingLimit(Base):
+    """A WebSocket-triggered synthetic limit entry — NOT a resting broker order.
+
+    The server-side risk monitor watches the live tick feed for this symbol; when
+    the LTP reaches the limit price (BUY: at or below; SELL: at or above) it
+    places the entry as its normal freeze-safe MARKET order. One-shot: the row
+    turns 'filled' or 'cancelled' and never re-fires.
+    """
+
+    __tablename__ = "scalping_pending_limit"
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(60), nullable=False)
+    exchange = Column(String(10), nullable=False)
+    product = Column(String(10), nullable=False)  # MIS | NRML
+    # Trading mode this limit belongs to: "analyze" (sandbox) or "live". Segregated
+    # like SLs so the monitor never fills a live entry from analyze mode or back.
+    mode = Column(String(10), nullable=False, default="analyze")
+    action = Column(String(4), nullable=False, default="BUY")  # BUY | SELL
+    quantity = Column(Integer, nullable=False, default=0)
+    limit_price = Column(Float, nullable=False)
+    status = Column(String(10), nullable=False, default="pending")  # pending|filled|cancelled
+    filled_ltp = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    filled_at = Column(DateTime(timezone=True), nullable=True)
+
+
 def init_db():
     """Create the scalping tables if they don't exist."""
     from database.db_init_helper import init_db_with_logging
@@ -141,7 +167,9 @@ def _migrate_mode_unique(model, table_name: str):
     # Read all rows into memory FIRST — survives even a catastrophic failure below.
     try:
         with engine.connect() as conn:
-            rows = [dict(r._mapping) for r in conn.execute(text(f"SELECT {collist} FROM {table_name}"))]
+            rows = [
+                dict(r._mapping) for r in conn.execute(text(f"SELECT {collist} FROM {table_name}"))
+            ]
     except Exception as e:
         logger.exception(f"Error reading {table_name} before mode migration: {e}")
         return
@@ -171,8 +199,11 @@ def _migrate_mode_unique(model, table_name: str):
                     existing = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
                     if not existing:
                         conn.execute(model.__table__.insert(), rows)
-                        logger.warning("Scalping DB: %s restored %d rows after failed migration",
-                                       table_name, len(rows))
+                        logger.warning(
+                            "Scalping DB: %s restored %d rows after failed migration",
+                            table_name,
+                            len(rows),
+                        )
         except Exception as re:
             logger.exception(f"Recovery for {table_name} failed: {re}")
 
@@ -197,8 +228,10 @@ def _migrate_add_columns():
                 # Existing rows default to 'analyze' (conservative: the live
                 # monitor will not auto-act on pre-existing/ambiguous SLs).
                 conn.execute(
-                    text("ALTER TABLE scalping_sl_state ADD COLUMN mode VARCHAR(10) "
-                         "NOT NULL DEFAULT 'analyze'")
+                    text(
+                        "ALTER TABLE scalping_sl_state ADD COLUMN mode VARCHAR(10) "
+                        "NOT NULL DEFAULT 'analyze'"
+                    )
                 )
                 logger.info("Scalping DB: added mode column to scalping_sl_state")
 
@@ -207,8 +240,10 @@ def _migrate_add_columns():
             if "mode" not in tracked_cols:
                 with engine.begin() as conn:
                     conn.execute(
-                        text("ALTER TABLE scalping_tracked_symbol ADD COLUMN mode VARCHAR(10) "
-                             "NOT NULL DEFAULT 'analyze'")
+                        text(
+                            "ALTER TABLE scalping_tracked_symbol ADD COLUMN mode VARCHAR(10) "
+                            "NOT NULL DEFAULT 'analyze'"
+                        )
                     )
                 logger.info("Scalping DB: added mode column to scalping_tracked_symbol")
     except Exception as e:
@@ -329,9 +364,7 @@ def track_symbol(symbol: str, exchange: str, product: str, mode: str = "analyze"
         )
         if exists is None:
             db_session.add(
-                ScalpingTrackedSymbol(
-                    symbol=symbol, exchange=exchange, product=product, mode=mode
-                )
+                ScalpingTrackedSymbol(symbol=symbol, exchange=exchange, product=product, mode=mode)
             )
             db_session.commit()
         return True
@@ -368,5 +401,104 @@ def clear_tracked_symbols(mode: str | None = None) -> bool:
         return True
     except Exception as e:
         logger.exception(f"Error clearing scalping tracked symbols: {e}")
+        db_session.rollback()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Synthetic limit entries (WebSocket-triggered, market order on trigger)
+# ---------------------------------------------------------------------------
+
+
+def _limit_to_dict(row: "ScalpingPendingLimit") -> dict:
+    return {
+        "id": row.id,
+        "symbol": row.symbol,
+        "exchange": row.exchange,
+        "product": row.product,
+        "mode": row.mode,
+        "action": row.action,
+        "quantity": row.quantity,
+        "limit_price": row.limit_price,
+        "status": row.status,
+        "filled_ltp": row.filled_ltp,
+        "created_at": str(row.created_at) if row.created_at else None,
+        "filled_at": str(row.filled_at) if row.filled_at else None,
+    }
+
+
+def create_pending_limit(data: dict) -> dict | None:
+    """Register a synthetic limit entry for the risk monitor to watch."""
+    try:
+        row = ScalpingPendingLimit(
+            symbol=data["symbol"],
+            exchange=data["exchange"],
+            product=data["product"],
+            mode=data.get("mode") or "analyze",
+            action=data["action"],
+            quantity=int(data["quantity"]),
+            limit_price=float(data["limit_price"]),
+            status="pending",
+        )
+        db_session.add(row)
+        db_session.commit()
+        return _limit_to_dict(row)
+    except (KeyError, TypeError, ValueError) as e:
+        logger.error(f"create_pending_limit missing/invalid field: {e}")
+        db_session.rollback()
+        return None
+    except Exception as e:
+        logger.exception(f"Error creating scalping pending limit: {e}")
+        db_session.rollback()
+        return None
+
+
+def get_pending_limits(mode: str | None = None) -> list[dict]:
+    """Return rows still waiting for their price trigger, scoped to a mode."""
+    try:
+        q = db_session.query(ScalpingPendingLimit).filter_by(status="pending")
+        if mode is not None:
+            q = q.filter_by(mode=mode)
+        return [_limit_to_dict(r) for r in q.order_by(ScalpingPendingLimit.id.asc()).all()]
+    except Exception as e:
+        logger.exception(f"Error fetching scalping pending limits: {e}")
+        db_session.rollback()
+        return []
+
+
+def cancel_pending_limit(limit_id: int, mode: str | None = None) -> dict | None:
+    """Mark a pending limit 'cancelled'. Returns the row, or None when it was
+    already resolved (a fill won the race) or does not exist for this mode."""
+    try:
+        q = db_session.query(ScalpingPendingLimit).filter_by(id=limit_id, status="pending")
+        if mode is not None:
+            q = q.filter_by(mode=mode)
+        row = q.first()
+        if row is None:
+            return None
+        row.status = "cancelled"
+        db_session.commit()
+        return _limit_to_dict(row)
+    except Exception as e:
+        logger.exception(f"Error cancelling scalping pending limit {limit_id}: {e}")
+        db_session.rollback()
+        return None
+
+
+def mark_pending_limit_filled(limit_id: int, filled_ltp: float | None) -> bool:
+    """Record the fill of a synthetic limit entry (monitor, after order success)."""
+    try:
+        row = db_session.query(ScalpingPendingLimit).filter_by(id=limit_id).first()
+        if row is None:
+            return False
+        if row.status != "pending":
+            return False  # already cancelled/filled — never resurrect
+        row.status = "filled"
+        row.filled_ltp = filled_ltp
+        row.filled_at = func.now()
+        db_session.commit()
+        return True
+    except Exception as e:
+        logger.exception(f"Error marking scalping pending limit {limit_id} filled: {e}")
         db_session.rollback()
         return False

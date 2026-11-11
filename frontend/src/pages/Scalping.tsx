@@ -4,6 +4,7 @@ import { scalpingApi } from '@/api/scalping'
 import { type QuotesData, tradingApi } from '@/api/trading'
 import { ScalpChart } from '@/components/scalping/ScalpChart'
 import { SetSLDialog } from '@/components/scalping/SetSLDialog'
+import { useSocketContext } from '@/components/socket/SocketProvider'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -37,7 +38,9 @@ import { useThemeStore } from '@/stores/themeStore'
 import type {
   OptionChainRow,
   OptionType,
+  PendingLimit,
   ScalpingAction,
+  ScalpingLimitUpdateEvent,
   ScalpingPositionRow,
   ScalpingProduct,
   SearchInstrument,
@@ -300,6 +303,12 @@ export default function Scalping() {
   // Order-entry controls. The One-Click arm state is captured/persisted across reloads.
   const [armed, setArmed] = useState<boolean>(loadArmed)
   const [lots, setLots] = useState(1)
+  // Order type: MARKET fires immediately; LIMIT arms a WebSocket-triggered
+  // synthetic limit — the server-side monitor places the entry as a MARKET
+  // order the moment the live LTP reaches the level (no resting broker order).
+  const [orderType, setOrderType] = useState<'MARKET' | 'LIMIT'>('MARKET')
+  const [limitPrice, setLimitPrice] = useState('')
+  const [pendingLimits, setPendingLimits] = useState<PendingLimit[]>([])
   const [product, setProduct] = useState<ScalpingProduct>('NRML')
   const [lastLatencyMs, setLastLatencyMs] = useState<number | null>(null)
 
@@ -829,6 +838,8 @@ export default function Scalping() {
     appMode,
     segment,
     equityShares,
+    orderType,
+    limitPrice,
   })
   stateRef.current = {
     armed,
@@ -840,12 +851,47 @@ export default function Scalping() {
     appMode,
     segment,
     equityShares,
+    orderType,
+    limitPrice,
   }
 
   // Min gap between two order fires. Bounds the rate (prevents accidental
   // double-taps and held-key bursts) while still allowing deliberate fast
   // scalping. Held-key auto-repeat is additionally filtered via e.repeat below.
   const lastFireRef = useRef(0)
+
+  // Armed synthetic limits (WebSocket-triggered entries): loaded once per
+  // trading mode and refreshed by the monitor's 'scalping_limit_update'
+  // pushes — event-driven, no polling.
+  const refreshLimitOrders = useCallback(() => {
+    scalpingApi
+      .getPendingLimits()
+      .then((resp) => {
+        if (resp.status === 'success') setPendingLimits(resp.data)
+      })
+      .catch(() => {})
+  }, [])
+
+  const doCancelLimit = useCallback(
+    async (id: number) => {
+      try {
+        const res = await scalpingApi.cancelPendingLimit(id)
+        if (res.status !== 'success') {
+          showToast.error(res.message ?? 'Could not cancel the limit', 'orders')
+        }
+      } catch {
+        showToast.error('Could not cancel the limit', 'orders')
+      }
+      refreshLimitOrders()
+    },
+    [refreshLimitOrders]
+  )
+
+  // Load the mode-scoped armed limits on mount / trading-mode change.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: appMode is an intentional reload trigger
+  useEffect(() => {
+    refreshLimitOrders()
+  }, [refreshLimitOrders, appMode])
 
   // After an entry, auto-attach the global predefined SL / Target (points or %
   // of the fill LTP) so the websocket SL engine manages the exit.
@@ -888,6 +934,40 @@ export default function Scalping() {
     [setSL]
   )
 
+  // A synthetic limit filled server-side: clear the armed chip, toast, and
+  // auto-attach the predefined SL/target exactly like a market entry. The
+  // placed order's own order_event/analyzer_update refreshes the books.
+  const { socket } = useSocketContext()
+  useEffect(() => {
+    if (!socket) return
+    const onLimitUpdate = (data: ScalpingLimitUpdateEvent) => {
+      refreshLimitOrders()
+      if (data.status === 'filled' && data.symbol && data.exchange) {
+        showToast.success(
+          `Filled: ${data.action} ${data.quantity} ${data.symbol} at ~${data.ltp ?? '?'} (limit trigger)`,
+          'orders'
+        )
+        attachPredefinedSL(
+          {
+            symbol: data.symbol,
+            exchange: data.exchange,
+            optionType: 'CE',
+            strike: 0,
+            lotsize: 0,
+            tickSize: 0,
+          },
+          data.action ?? 'BUY',
+          data.quantity ?? 0,
+          data.product ?? 'MIS'
+        )
+      }
+    }
+    socket.on('scalping_limit_update', onLimitUpdate)
+    return () => {
+      socket.off('scalping_limit_update', onLimitUpdate)
+    }
+  }, [socket, refreshLimitOrders, attachPredefinedSL])
+
   const submitOrder = useCallback(
     async (leg: SelectedLeg | null, action: ScalpingAction) => {
       const s = stateRef.current
@@ -912,6 +992,41 @@ export default function Scalping() {
       const sentLots = isEquity ? undefined : s.lots
       if (quantity <= 0) {
         showToast.error('Quantity must be positive', 'orders')
+        return
+      }
+      // Synthetic limit entry: no order is sent now. The server-side risk
+      // monitor watches the live tick feed for this symbol and fires the
+      // entry as a MARKET order the moment the LTP reaches the level.
+      if (s.orderType === 'LIMIT') {
+        const lp = Number(s.limitPrice)
+        if (!Number.isFinite(lp) || lp <= 0) {
+          showToast.error('Enter a valid limit price first', 'orders')
+          return
+        }
+        try {
+          const limitLtp = marketDataRef.current.get(`${leg.exchange}:${leg.symbol}`)?.data?.ltp
+          const res = await scalpingApi.placeLimitOrder({
+            symbol: leg.symbol,
+            exchange: leg.exchange,
+            action,
+            quantity,
+            product: s.product,
+            lots: sentLots,
+            limit_price: lp,
+            ltp: limitLtp != null && limitLtp > 0 ? limitLtp : undefined,
+          })
+          if (res.status === 'success') {
+            showToast.success(
+              `Armed: ${action} ${leg.symbol} @ ${lp} — fills as a market order when the price reaches it`,
+              'orders'
+            )
+            refreshLimitOrders()
+          } else {
+            showToast.error(res.message ?? 'Could not arm the limit order', 'orders')
+          }
+        } catch (e) {
+          showToast.error(apiErrorMessage(e), 'orders')
+        }
         return
       }
       const t0 = performance.now()
@@ -947,7 +1062,7 @@ export default function Scalping() {
         if (!handledGlobally) showToast.error(apiErrorMessage(e), 'orders')
       }
     },
-    [attachPredefinedSL]
+    [attachPredefinedSL, refreshLimitOrders]
   )
 
   // Note: close-all / cancel-all (F6/F7) and the trailing-SL auto-exit are
@@ -1523,7 +1638,7 @@ export default function Scalping() {
                         Math.max(1, Math.min(maxLots, Math.floor(Number(e.target.value) || 1)))
                       )
                     }
-                    className="w-16 text-center font-mono tabular-nums"
+                    className="w-24 text-center font-mono tabular-nums"
                   />
                   <Button
                     variant="outline"
@@ -1554,14 +1669,29 @@ export default function Scalping() {
 
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">Order Type</span>
-              <Select value="MARKET" disabled>
+              <Select
+                value={orderType}
+                onValueChange={(v) => setOrderType(v as 'MARKET' | 'LIMIT')}
+              >
                 <SelectTrigger className="w-28">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="MARKET">Market</SelectItem>
+                  <SelectItem value="LIMIT">Limit</SelectItem>
                 </SelectContent>
               </Select>
+              {orderType === 'LIMIT' && (
+                <Input
+                  type="number"
+                  inputMode="decimal"
+                  value={limitPrice}
+                  onChange={(e) => setLimitPrice(e.target.value)}
+                  placeholder="Limit price"
+                  className="w-24"
+                  title="No order is placed now — the server watches the live price and fires this entry as a market order when it reaches this level"
+                />
+              )}
             </div>
 
             {/* Global predefined SL — auto-attached to every entry when enabled */}
@@ -1746,6 +1876,40 @@ export default function Scalping() {
               Cancel All Orders / F7
             </Button>
           </div>
+
+          {pendingLimits.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-muted-foreground">
+                Armed limits — fire as a market order when the live price reaches the level:
+              </span>
+              {pendingLimits.map((pl) => (
+                <span
+                  key={pl.id}
+                  className="flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 font-mono text-xs"
+                  title="WebSocket-triggered entry — no order sits at the broker yet"
+                >
+                  <span
+                    className={
+                      pl.action === 'BUY'
+                        ? 'font-semibold text-green-600'
+                        : 'font-semibold text-red-600'
+                    }
+                  >
+                    {pl.action}
+                  </span>
+                  {pl.quantity} {pl.symbol} @ {pl.limit_price}
+                  <button
+                    type="button"
+                    onClick={() => doCancelLimit(pl.id)}
+                    className="rounded px-1 text-muted-foreground hover:text-foreground"
+                    title="Cancel this armed limit"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
 
           <span className="text-xs text-muted-foreground">
             {isSingle

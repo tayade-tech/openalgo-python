@@ -113,6 +113,42 @@ export interface SLStatesResponse {
   data: ScalpingSLState[]
 }
 
+// A WebSocket-triggered synthetic limit entry: NOT a resting broker order. The
+// server-side risk monitor watches the live tick feed and fires this entry as
+// a MARKET order when the LTP reaches limit_price (BUY: at/below, SELL: at/above).
+export interface PendingLimit {
+  id: number
+  symbol: string
+  exchange: string
+  product: ScalpingProduct
+  action: ScalpingAction
+  quantity: number
+  limit_price: number
+  mode?: string
+  status?: string
+}
+
+export interface PendingLimitsResponse {
+  status: string
+  data: PendingLimit[]
+}
+
+// Pushed by the server-side risk monitor over SocketIO when a synthetic limit
+// fills (one-shot) — the UI clears the armed chip, toasts and auto-attaches
+// the predefined SL/target like a market entry.
+export interface ScalpingLimitUpdateEvent {
+  id: number
+  status: 'filled' | 'cancelled'
+  symbol?: string
+  exchange?: string
+  product?: ScalpingProduct
+  action?: ScalpingAction
+  quantity?: number
+  limit_price?: number
+  ltp?: number
+  orderid?: string
+}
+
 // Derived per-(symbol, exchange, product) row for the position book.
 // Combines the current open position, today's buy/sell trades, realized +
 // unrealized P&L, and the active SL. Rows with netQty 0 still appear if there

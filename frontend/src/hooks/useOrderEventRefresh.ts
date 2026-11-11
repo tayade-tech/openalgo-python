@@ -13,6 +13,8 @@ export type OrderEventType =
   | 'modify_order_event'
   // Pushed by the server-side scalping risk monitor when it trails/clears an SL.
   | 'scalping_sl_update'
+  // Pushed by the server-side scalping risk monitor when a synthetic limit fills.
+  | 'scalping_limit_update'
 
 /**
  * Configuration options for useOrderEventRefresh hook

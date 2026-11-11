@@ -8,10 +8,15 @@ the engine server-side and is fully event-driven — there is NO polling:
 
   * Prices arrive as live ticks from the unified WebSocket proxy
     (services/websocket_client.py), and each tick drives one evaluation.
-  * The watched-symbol set changes only when an SL is saved/deleted — the
-    /scalping SL endpoints call sync(), so the monitor never polls the DB either.
+  * The watched-symbol set changes only when an SL is saved/deleted or a
+    synthetic limit entry is armed/filled/cancelled — the /scalping endpoints
+    call sync(), so the monitor never polls the DB either.
   * Trailing updates and auto-clears are pushed to the browser via a SocketIO
     'scalping_sl_update' event, so the UI is event-driven too (no interval polling).
+  * Synthetic limit entries (armed at /scalping/api/limit) are one-shot
+    WebSocket triggers: when the LTP reaches the limit price the entry is
+    placed as its normal freeze-safe MARKET order (blueprints.scalping.
+    _place_entry) and the browser is told via 'scalping_limit_update'.
 
 On breach the monitor fires a freeze-safe, whole-lot risk-reducing exit
 (blueprints.scalping._reducing_exit) sized to the CURRENT live position, then
@@ -41,6 +46,7 @@ MIN_TRAIL_PROFIT = 1.0  # don't trail until >= 1 in profit (matches the UI engin
 PERSIST_THROTTLE_SEC = 1.5  # rate-limit trailing-SL writes (latest value, bounds restart staleness)
 EMIT_THROTTLE_SEC = 1.0  # debounce browser SL-update pushes
 EXIT_RETRY_COOLDOWN_SEC = 3.0  # throttle re-dispatch for a leg (anti double-fire); no auto-retry
+LIMIT_RETRY_COOLDOWN_SEC = 3.0  # throttle re-fire for an armed limit whose entry failed
 SUBSCRIBE_MODE = "LTP"
 
 
@@ -131,6 +137,12 @@ class ScalpingRiskMonitor:
         self._last_exit_attempt: dict[str, float] = {}
         self._last_persist: dict[str, float] = {}
         self._last_emit: dict[str, float] = {}
+        # Synthetic limit entries: id -> pending limit row (in-memory source of
+        # truth, rebuilt by sync()); one-shot triggers that place the entry as
+        # a MARKET order when the live LTP reaches the limit price.
+        self._limits: dict[int, dict] = {}
+        self._limit_inflight: set[int] = set()
+        self._last_limit_attempt: dict[int, float] = {}
         # Background sync coalescing — sync() does blocking WS subscribe calls (up to
         # ~12s for the proxy ack), so it must NEVER run on a request thread.
         # request_sync() schedules it on a single daemon worker and coalesces repeats.
@@ -193,18 +205,21 @@ class ScalpingRiskMonitor:
 
     # ------------------------------------------------------------------ sync (event)
     def sync(self) -> None:
-        """Reconcile watched symbols with the active SL states.
+        """Reconcile watched symbols with active SL states and pending limits.
 
-        Called at startup and by the SL save/delete endpoints — never on a timer.
-        Rebuilds the in-memory state from the DB and subscribes/unsubscribes the
-        feed to exactly the set of symbols that have an active SL.
+        Called at startup and by the SL / limit save/delete endpoints — never on
+        a timer. Rebuilds the in-memory state from the DB and
+        subscribes/unsubscribes the feed to exactly the set of symbols that any
+        active SL or pending limit still needs.
         """
-        from database.scalping_db import get_active_sl_states
+        from database.scalping_db import get_active_sl_states, get_pending_limits
 
         try:
-            # Only watch SLs for the CURRENT trading mode so sandbox SLs never
-            # drive live exits (and vice-versa).
-            rows = get_active_sl_states(mode=self._mode())
+            # Only watch SLs/limits for the CURRENT trading mode so sandbox state
+            # never drives live orders (and vice-versa).
+            mode = self._mode()
+            rows = get_active_sl_states(mode=mode)
+            limits = get_pending_limits(mode=mode)
         finally:
             self._remove_session("database.scalping_db")
 
@@ -213,7 +228,17 @@ class ScalpingRiskMonitor:
         # they never block tick processing (_on_tick).
         with self._lock:
             self._states = {_slkey(r["symbol"], r["exchange"], r["product"]): dict(r) for r in rows}
-            wanted_syms = {_symkey(r["symbol"], r["exchange"]) for r in rows}
+            self._limits = {int(lim["id"]): dict(lim) for lim in limits}
+            # Drop cooldown/inflight bookkeeping for limits no longer pending
+            # (filled, cancelled or deleted while a worker was running).
+            live_ids = set(self._limits)
+            self._limit_inflight &= live_ids
+            self._last_limit_attempt = {
+                k: v for k, v in self._last_limit_attempt.items() if k in live_ids
+            }
+            wanted_syms = {_symkey(r["symbol"], r["exchange"]) for r in rows} | {
+                _symkey(lim["symbol"], lim["exchange"]) for lim in limits
+            }
             to_remove = self._subscribed - wanted_syms
 
         if not wanted_syms:
@@ -340,6 +365,27 @@ class ScalpingRiskMonitor:
                     state["highest_price"] = result["highest_price"]
                     state["lowest_price"] = result["lowest_price"]
                     self._maybe_persist(key, state)
+            # Synthetic limit entries on the same tick stream. Snapshot under
+            # the lock (a worker thread pops filled ids concurrently).
+            limits_snapshot = [
+                (lid, dict(lim))
+                for lid, lim in self._limits.items()
+                if lim.get("symbol") == symbol and lim.get("exchange") == exchange
+            ]
+            for lid, lim in limits_snapshot:
+                # Same mode guard as SLs: never fill a live entry from analyze
+                # mode or back; skip and wait for the next tick.
+                if current_mode and lim.get("mode") and lim.get("mode") != current_mode:
+                    continue
+                limit_price = lim.get("limit_price") or 0.0
+                if limit_price <= 0:
+                    continue
+                side = (lim.get("action") or "BUY").upper()
+                # Synthetic limit semantics; a trigger on the far side of the
+                # market fills on the first tick (market-equivalent).
+                triggered = ltp <= limit_price if side == "BUY" else ltp >= limit_price
+                if triggered:
+                    self._dispatch_limit(lid, lim, ltp)
         # symkey kept for symmetry / future per-symbol bookkeeping
         del symkey
 
@@ -468,6 +514,133 @@ class ScalpingRiskMonitor:
         finally:
             self._exit_inflight.discard(key)
             self._remove_sessions()
+
+    # ------------------------------------------------------------------ synthetic limit fill
+    def _dispatch_limit(self, lid: int, lim: dict, ltp: float) -> None:
+        """Fire an armed synthetic limit entry once, off the tick thread."""
+        now = time.monotonic()
+        if lid in self._limit_inflight:
+            return
+        if now - self._last_limit_attempt.get(lid, 0.0) < LIMIT_RETRY_COOLDOWN_SEC:
+            return
+        self._last_limit_attempt[lid] = now
+        self._limit_inflight.add(lid)
+        worker = threading.Thread(
+            target=self._limit_worker,
+            args=(lid, lim, ltp),
+            name=f"scalping-limit-{lid}",
+            daemon=True,
+        )
+        worker.start()
+
+    def _limit_worker(self, lid: int, lim: dict, ltp: float) -> None:
+        symbol = lim["symbol"]
+        exchange = lim["exchange"]
+        product = lim["product"]
+        action = (lim.get("action") or "BUY").upper()
+        quantity = int(lim.get("quantity") or 0)
+        try:
+            # Mode guard, same as exits: a limit armed in analyze mode must not
+            # fill live (and vice-versa). It stays armed and waits.
+            lim_mode = lim.get("mode")
+            cur_mode = self._mode()
+            if lim_mode and cur_mode is not None and lim_mode != cur_mode:
+                return
+            auth = self._resolve_auth()
+            if auth is None:
+                logger.error(
+                    "Scalping limit fill for %s (id %s): no auth (not logged in) — "
+                    "still armed, will retry on the next tick",
+                    symbol,
+                    lid,
+                )
+                return
+            api_key, _auth_token, _broker = auth
+            from blueprints.scalping import _place_entry
+
+            ok, resp, _code = _place_entry(
+                symbol,
+                exchange,
+                action,
+                product,
+                quantity,
+                api_key,
+                _auth_token,
+                _broker,
+                ltp=ltp,  # sandbox mode prices the fill with this LTP
+            )
+            if ok:
+                from database.scalping_db import mark_pending_limit_filled
+
+                try:
+                    mark_pending_limit_filled(lid, ltp)
+                finally:
+                    self._remove_session("database.scalping_db")
+                with self._lock:
+                    self._limits.pop(lid, None)
+                    self._limit_inflight.discard(lid)
+                    self._last_limit_attempt.pop(lid, None)
+                logger.info(
+                    "Scalping limit FILLED: %s %s %s qty %d @~%.2f (trigger %.2f)",
+                    action,
+                    symbol,
+                    product,
+                    quantity,
+                    ltp,
+                    lim.get("limit_price") or 0.0,
+                )
+                self._emit_limit_update(lid, "filled", lim, ltp=ltp, response=resp)
+                # Drop the feed subscription when nothing else needs this symbol.
+                self.request_sync()
+            else:
+                # The entry did not place (broker rejection, a split child
+                # failure, or an internal error). The trigger STAYS ARMED:
+                # while the price stays at/beyond the limit, the tick engine
+                # re-fires (throttled by _dispatch_limit) — the same recovery
+                # doctrine as the SL exits. Never loops on its own.
+                msg = resp.get("message") if isinstance(resp, dict) else resp
+                logger.error(
+                    "Scalping limit entry FAILED for %s (id %s) — still armed, "
+                    "tick engine will re-fire: %s",
+                    symbol,
+                    lid,
+                    msg,
+                )
+        except Exception as e:
+            logger.exception("Scalping limit fill error for %s (id %s): %s", symbol, lid, e)
+        finally:
+            self._limit_inflight.discard(lid)
+            self._remove_sessions()
+
+    def _emit_limit_update(
+        self,
+        lid: int,
+        status: str,
+        lim: dict,
+        ltp: float | None = None,
+        response: dict | None = None,
+    ) -> None:
+        """One-shot push to the /scalping UI: the fill (with its order id)."""
+        try:
+            from extensions import socketio
+
+            payload: dict = {
+                "id": lid,
+                "status": status,
+                "symbol": lim.get("symbol"),
+                "exchange": lim.get("exchange"),
+                "product": lim.get("product"),
+                "action": lim.get("action"),
+                "quantity": lim.get("quantity"),
+                "limit_price": lim.get("limit_price"),
+            }
+            if ltp is not None:
+                payload["ltp"] = ltp
+            if isinstance(response, dict) and response.get("orderid"):
+                payload["orderid"] = response.get("orderid")
+            socketio.emit("scalping_limit_update", payload)
+        except Exception as e:
+            logger.debug("scalping_limit_update emit failed: %s", e)
 
     def _clear_state(
         self, key: str, symbol: str, exchange: str, product: str, mode: str | None = None

@@ -1,6 +1,8 @@
 import type {
   ExpiryResponse,
   OptionChainResponse,
+  PendingLimit,
+  PendingLimitsResponse,
   ScalpingOrderRequest,
   ScalpingOrderResponse,
   ScalpingSLState,
@@ -108,6 +110,28 @@ export const scalpingApi = {
 
   placeOrder: async (req: ScalpingOrderRequest): Promise<ScalpingOrderResponse> => {
     const response = await webClient.post<ScalpingOrderResponse>('/scalping/api/order', req)
+    return response.data
+  },
+
+  // Arm a synthetic limit entry: no order is sent now — the server-side risk
+  // monitor fires this entry as a MARKET order when the live LTP reaches
+  // limit_price (BUY: at/below; SELL: at/above). Not a resting broker order.
+  placeLimitOrder: async (
+    req: ScalpingOrderRequest & { limit_price: number }
+  ): Promise<{ status: string; data?: PendingLimit; message?: string }> => {
+    const response = await webClient.post('/scalping/api/limit', req)
+    return response.data
+  },
+
+  getPendingLimits: async (): Promise<PendingLimitsResponse> => {
+    const response = await webClient.get<PendingLimitsResponse>('/scalping/api/limit')
+    return response.data
+  },
+
+  cancelPendingLimit: async (
+    id: number
+  ): Promise<{ status: string; data?: PendingLimit; message?: string }> => {
+    const response = await webClient.delete('/scalping/api/limit', { data: { id } })
     return response.data
   },
 

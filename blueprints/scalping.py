@@ -712,13 +712,13 @@ def _entry_split_chunk(symbol: str, exchange: str, quantity: int) -> int:
     return chunk if quantity > chunk else 0
 
 
-@scalping_bp.route("/scalping/api/order", methods=["POST"])
-@check_session_validity
-@track_latency("PLACE")
-def order():
-    """Place a single MARKET order for a scalping leg (BUY/SELL CE/PE)."""
-    data = request.get_json(silent=True) or {}
+def _validate_entry(data: dict):
+    """Shared validation for scalping entry payloads (market / synthetic limit).
 
+    Returns (values, error): values carries the coerced fields on success, and
+    error is a (response, status_code) tuple on failure. Byte-identical to the
+    original /order validation so both entry paths enforce the same rules.
+    """
     symbol = (data.get("symbol") or "").strip()
     exchange = (data.get("exchange") or "").strip().upper()
     action = (data.get("action") or "").strip().upper()
@@ -735,19 +735,23 @@ def order():
     lots = data.get("lots")
 
     if not symbol:
-        return jsonify({"status": "error", "message": "symbol is required"}), 400
+        return None, ({"status": "error", "message": "symbol is required"}, 400)
     if exchange not in VALID_ORDER_EXCHANGES:
-        return jsonify({"status": "error", "message": f"Invalid exchange: {exchange}"}), 400
+        return None, ({"status": "error", "message": f"Invalid exchange: {exchange}"}, 400)
     if action not in VALID_ACTIONS:
-        return jsonify({"status": "error", "message": f"Invalid action: {action}"}), 400
+        return None, ({"status": "error", "message": f"Invalid action: {action}"}, 400)
     if product not in _allowed_products(exchange):
-        return jsonify(
-            {"status": "error", "message": f"Invalid product for {exchange}: {product}"}
-        ), 400
+        return None, (
+            {"status": "error", "message": f"Invalid product for {exchange}: {product}"},
+            400,
+        )
     if quantity <= 0:
-        return jsonify({"status": "error", "message": "quantity must be positive"}), 400
+        return None, ({"status": "error", "message": "quantity must be positive"}, 400)
     if quantity > MAX_ORDER_QUANTITY:
-        return jsonify({"status": "error", "message": "quantity exceeds the safety limit"}), 400
+        return None, (
+            {"status": "error", "message": "quantity exceeds the safety limit"},
+            400,
+        )
 
     if _is_derivative(exchange):
         # Derivatives trade in lots: enforce lot-size multiple.
@@ -755,26 +759,44 @@ def order():
             try:
                 lots = int(lots)
             except (TypeError, ValueError):
-                return jsonify({"status": "error", "message": "lots must be an integer"}), 400
+                return None, ({"status": "error", "message": "lots must be an integer"}, 400)
             if lots < 1:
-                return jsonify({"status": "error", "message": "lots must be at least 1"}), 400
+                return None, ({"status": "error", "message": "lots must be at least 1"}, 400)
         qty_err = _validate_quantity(symbol, exchange, quantity)
         if qty_err:
-            return jsonify({"status": "error", "message": qty_err}), 400
+            return None, ({"status": "error", "message": qty_err}, 400)
     # Equity (NSE/BSE) trades in whole shares; quantity bounds above are sufficient.
 
-    auth_token, broker, api_key, err, code = _resolve_session_auth()
-    if err:
-        return jsonify(err), code
+    return (
+        {
+            "symbol": symbol,
+            "exchange": exchange,
+            "action": action,
+            "product": product,
+            "quantity": quantity,
+            "lots": lots,
+        },
+        None,
+    )
 
-    # Pass the client-supplied LTP (from the live WebSocket feed) through as a prefetched
+
+def _place_entry(
+    symbol, exchange, action, product, quantity, api_key, auth_token, broker, ltp=None
+):
+    """Place a freeze-safe MARKET entry and track the instrument on success.
+
+    Shared by the /order endpoint (an explicit market entry) and the risk
+    monitor's synthetic-limit fills (the price was decided by the WebSocket
+    LTP; the order still leaves as MARKET). Auto-splits entries above the
+    exchange freeze limit, exactly as the /order endpoint always did.
+    """
+    # Pass the supplied LTP (from the live WebSocket feed) through as a prefetched
     # quote. In analyze/sandbox mode the sandbox engine uses it instead of fetching its own
     # per-order quote (which retries with sleeps and stalls placement). Ignored in live mode.
     prefetched_quote = None
-    ltp_raw = data.get("ltp")
-    if ltp_raw is not None:
+    if ltp is not None:
         try:
-            ltp_val = float(ltp_raw)
+            ltp_val = float(ltp)
             if ltp_val > 0:
                 prefetched_quote = {"ltp": ltp_val}
         except (TypeError, ValueError):
@@ -828,7 +850,109 @@ def order():
         from database.scalping_db import track_symbol
 
         track_symbol(symbol, exchange, product, mode=_current_mode())
+    return success, response, status_code
+
+
+@scalping_bp.route("/scalping/api/order", methods=["POST"])
+@check_session_validity
+@track_latency("PLACE")
+def order():
+    """Place a single MARKET order for a scalping leg (BUY/SELL CE/PE)."""
+    data = request.get_json(silent=True) or {}
+
+    values, err = _validate_entry(data)
+    if err:
+        return jsonify(err[0]), err[1]
+
+    auth_token, broker, api_key, err, code = _resolve_session_auth()
+    if err:
+        return jsonify(err), code
+
+    success, response, status_code = _place_entry(
+        values["symbol"],
+        values["exchange"],
+        values["action"],
+        values["product"],
+        values["quantity"],
+        api_key,
+        auth_token,
+        broker,
+        ltp=data.get("ltp"),
+    )
     return jsonify(response), status_code
+
+
+@scalping_bp.route("/scalping/api/limit", methods=["POST"])
+@check_session_validity
+def create_limit():
+    """Arm a synthetic limit entry — a WebSocket trigger, NOT a resting broker order.
+
+    No order reaches the broker at arm time. The server-side risk monitor
+    watches the live tick feed for this symbol and, when the LTP reaches the
+    limit price (BUY: at or below; SELL: at or above), places the entry as its
+    normal freeze-safe MARKET order. The trigger is one-shot and can be
+    cancelled anytime without touching the broker.
+    """
+    data = request.get_json(silent=True) or {}
+
+    values, err = _validate_entry(data)
+    if err:
+        return jsonify(err[0]), err[1]
+
+    try:
+        limit_price = float(data.get("limit_price"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "limit_price must be a number"}), 400
+    if not math.isfinite(limit_price) or limit_price <= 0:
+        return jsonify({"status": "error", "message": "limit_price must be greater than zero"}), 400
+
+    from database.scalping_db import create_pending_limit
+
+    row = create_pending_limit(
+        {
+            "symbol": values["symbol"],
+            "exchange": values["exchange"],
+            "product": values["product"],
+            "action": values["action"],
+            "quantity": values["quantity"],
+            "limit_price": limit_price,
+            "mode": _current_mode(),  # segregate sandbox vs live triggers
+        }
+    )
+    if row is None:
+        return jsonify({"status": "error", "message": "Failed to save limit order"}), 500
+    _notify_risk_monitor()
+    return jsonify({"status": "success", "data": row})
+
+
+@scalping_bp.route("/scalping/api/limit", methods=["GET"])
+@check_session_validity
+def list_limits():
+    """Return limits still waiting for their price trigger (mode-scoped)."""
+    from database.scalping_db import get_pending_limits
+
+    return jsonify({"status": "success", "data": get_pending_limits(mode=_current_mode())})
+
+
+@scalping_bp.route("/scalping/api/limit", methods=["DELETE"])
+@check_session_validity
+def cancel_limit():
+    """Cancel an armed synthetic limit entry (nothing at the broker to cancel)."""
+    from database.scalping_db import cancel_pending_limit
+
+    data = request.get_json(silent=True) or {}
+    try:
+        limit_id = int(data.get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "A valid limit id is required"}), 400
+
+    row = cancel_pending_limit(limit_id, mode=_current_mode())
+    if row is None:
+        return jsonify(
+            {"status": "error", "message": "Limit order not found or already resolved"}
+        ), 404
+    _notify_risk_monitor()
+    return jsonify({"status": "success", "data": row})
 
 
 def _reducing_exit(symbol, exchange, product, action, quantity, auth_token, broker, api_key):
