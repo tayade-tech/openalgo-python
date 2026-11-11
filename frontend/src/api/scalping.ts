@@ -70,7 +70,7 @@ export const scalpingApi = {
     underlying: string,
     exchange: string,
     expiry: string,
-    strikeCount = 10
+    strikeCount = 20
   ): Promise<OptionChainResponse> => {
     const response = await webClient.get<OptionChainResponse>('/scalping/api/strikes', {
       params: { underlying, exchange, expiry, strike_count: strikeCount },

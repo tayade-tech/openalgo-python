@@ -49,7 +49,7 @@ import type {
 } from '@/types/scalping'
 import { showToast } from '@/utils/toast'
 
-const DEFAULT_STRIKE_COUNT = 10
+const DEFAULT_STRIKE_COUNT = 20
 // Conservative per-order lot chunk when freeze_qty is unavailable. The lot count
 // itself is uncapped: the server auto-splits entries into freeze-sized orders,
 // so this is only the single-order slice size, not an input ceiling.
@@ -422,6 +422,8 @@ export default function Scalping() {
     queryKey: ['scalping', 'strikes', exchange, underlying, expiry],
     queryFn: () => scalpingApi.getStrikes(underlying, exchange, expiry, DEFAULT_STRIKE_COUNT),
     enabled: optionsMode && !!underlying && !!expiry,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
   })
   const chain = useMemo(() => chainResp?.chain ?? [], [chainResp])
   const foExchange = chainResp?.fo_exchange ?? exchange
@@ -1370,10 +1372,10 @@ export default function Scalping() {
               <div className="space-y-1">
                 <label className="text-sm text-muted-foreground">Expiry</label>
                 <Select value={expiry} onValueChange={setExpiry} disabled={!underlying}>
-                  <SelectTrigger>
+                  <SelectTrigger className="w-full">
                     <SelectValue placeholder="Select expiry" />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="max-h-72">
                     {expiries.map((e) => (
                       <SelectItem key={e} value={e}>
                         {e}
@@ -1386,10 +1388,10 @@ export default function Scalping() {
               <div className="space-y-1">
                 <label className="text-sm text-muted-foreground">Call Strike</label>
                 <Select value={ceStrike} onValueChange={setCeStrike} disabled={chain.length === 0}>
-                  <SelectTrigger>
+                  <SelectTrigger className="w-full">
                     <SelectValue placeholder="CE strike" />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="max-h-72">
                     {chain.map((r) => (
                       <SelectItem key={`ce-${r.strike}`} value={String(r.strike)}>
                         {r.strike} {r.ce.label ? `(${r.ce.label})` : ''}
@@ -1402,10 +1404,10 @@ export default function Scalping() {
               <div className="space-y-1">
                 <label className="text-sm text-muted-foreground">Put Strike</label>
                 <Select value={peStrike} onValueChange={setPeStrike} disabled={chain.length === 0}>
-                  <SelectTrigger>
+                  <SelectTrigger className="w-full">
                     <SelectValue placeholder="PE strike" />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="max-h-72">
                     {chain.map((r) => (
                       <SelectItem key={`pe-${r.strike}`} value={String(r.strike)}>
                         {r.strike} {r.pe.label ? `(${r.pe.label})` : ''}

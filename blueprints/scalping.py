@@ -484,9 +484,9 @@ def strikes():
         return jsonify({"status": "error", "message": "expiry parameter is required"}), 400
 
     try:
-        strike_count = int(request.args.get("strike_count", 10))
+        strike_count = int(request.args.get("strike_count", 20))
     except (TypeError, ValueError):
-        strike_count = 10
+        strike_count = 20
     strike_count = max(1, min(strike_count, 50))
 
     api_key = _get_api_key()
