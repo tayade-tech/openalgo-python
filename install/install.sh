@@ -733,7 +733,7 @@ log_message "\nCloning OpenAlgo repository..." "$BLUE"
 # branch switching working. Nearly all of that 280 MB is superseded
 # frontend/dist bundles that a server never reads. A host without filter
 # support just full-clones, so this is never worse than no flag at all.
-sudo git clone --filter=blob:none https://github.com/marketcalls/openalgo.git $OPENALGO_PATH
+sudo git clone --filter=blob:none https://github.com/tayade-tech/openalgo-python.git $OPENALGO_PATH
 check_status "Failed to clone OpenAlgo repository"
 
 # Create virtual environment using uv
